@@ -1,54 +1,59 @@
 <?php
-// result.php
-if (!isset($_GET['cuit'])) {
-    die("No se ingresó un CUIT/CUIL válido.");
+
+$servername = "localhost";
+$username = "root";
+$password = ""; 
+$dbname = "gestconsultasbcra";
+
+$conn = new mysqli($servername, $username, $password, $dbname);
+if ($conn->connect_error) {
+    die("Error de conexión: " . $conn->connect_error);
 }
 
-$cuit = preg_replace('/[^0-9]/', '', $_GET['cuit']); // solo números
+// Validar params
+
+if (!isset($_GET['cuit']) || !isset($_GET['telefono'])) {
+    die("Debe ingresar CUIT/CUIL/CDI y teléfono.");
+}
+
+$cuit = preg_replace('/[^0-9]/', '', $_GET['cuit']);
+$telefono = htmlspecialchars($_GET['telefono']);
 
 if (strlen($cuit) != 11) {
     die("El CUIT/CUIL debe tener 11 dígitos.");
 }
 
-// URL del endpoint del BCRA
+//call api bcra
 $url = "https://api.bcra.gob.ar/CentralDeDeudores/v1.0/Deudas/" . $cuit;
-
-// Inicializar cURL
 $ch = curl_init();
 curl_setopt($ch, CURLOPT_URL, $url);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-
-// Desactivar validación SSL (solo para pruebas locales)
 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
 curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-
 $response = curl_exec($ch);
-
 if (curl_errno($ch)) {
     die("Error en la conexión cURL: " . curl_error($ch));
 }
-
 curl_close($ch);
 
-// Decodificar JSON
 $data = json_decode($response, true);
-
-// Si no se pudo decodificar el JSON
 if (!$data) {
     die("Error al decodificar la respuesta de la API. Respuesta cruda:<br><pre>$response</pre>");
 }
 
-// =====================
-// Función de scoring
-// =====================
-function evaluar_credito($data) {
+//sys cfg
+$config = $conn->query("SELECT * FROM configuracion WHERE id=1")->fetch_assoc();
+$tasaMensual = $config['tasa_interes'] / 100;
+$baseMax = $config['monto_maximo'];
+$cuotasDisponibles = explode(',', $config['cuotas_permitidas']);
+
+// funcion de scoring
+function evaluar_credito($data, $baseMax) {
     if (!isset($data['results']['periodos'][0]['entidades'])) {
         return ["estado" => "No disponible", "monto" => 0];
     }
 
     $entidades = $data['results']['periodos'][0]['entidades'];
-
-    // Tomamos la peor situación de todas las entidades
     $peorSituacion = 1;
     $deudaTotal = 0;
     $diasAtrasoMax = 0;
@@ -56,38 +61,24 @@ function evaluar_credito($data) {
 
     foreach ($entidades as $e) {
         $situacion = $e['situacion'];
-        $monto = $e['monto'] * 1000; // convertir a pesos
+        $monto = $e['monto'] * 1000;
         $dias = $e['diasAtrasoPago'];
-
         $deudaTotal += $monto;
         if ($situacion > $peorSituacion) $peorSituacion = $situacion;
         if ($dias > $diasAtrasoMax) $diasAtrasoMax = $dias;
-
         if ($e['situacionJuridica'] || $e['procesoJud']) {
             $flagCritico = true;
         }
     }
 
-    // Factores según situación
-    $factores = [
-        1 => 1.0,
-        2 => 0.6,
-        3 => 0.3,
-        4 => 0.0,
-        5 => 0.0
-    ];
-
-    // Reglas de aprobación
+    $factores = [1 => 1.0, 2 => 0.6, 3 => 0.3, 4 => 0.0, 5 => 0.0];
     if ($peorSituacion >= 4 || $flagCritico) {
         return ["estado" => "Rechazado", "monto" => 0];
     }
-
     if ($diasAtrasoMax > 30) {
         return ["estado" => "Rechazado", "monto" => 0];
     }
 
-    // Monto base máximo definido en $100.000
-    $baseMax = 6000000;
     $montoMax = max(0, ($baseMax - $deudaTotal) * $factores[$peorSituacion]);
 
     return [
@@ -96,8 +87,61 @@ function evaluar_credito($data) {
     ];
 }
 
-// Evaluar crédito
-$evaluacion = ($data['status'] == 200) ? evaluar_credito($data) : null;
+// Eval
+$evaluacion = ($data['status'] == 200) ? evaluar_credito($data, $baseMax) : null;
+
+// save en db
+$denominacion = ($data && isset($data['status']) && $data['status'] == 200)
+    ? $conn->real_escape_string($data['results']['denominacion'])
+    : null;
+
+$estadoCredito = $evaluacion ? $evaluacion['estado'] : null;
+$montoCredito = $evaluacion ? $evaluacion['monto'] : null;
+
+$sql = "INSERT INTO consultas (cuit, telefono, denominacion, estado_credito, monto_credito) 
+        VALUES ('$cuit', '$telefono', " 
+        . ($denominacion ? "'$denominacion'" : "NULL") . ", "
+        . ($estadoCredito ? "'$estadoCredito'" : "NULL") . ", "
+        . ($montoCredito !== null ? $montoCredito : "NULL") . ")";
+$conn->query($sql);
+
+// simulador de cuotas
+function calcular_plan($monto, $meses, $tasaMensual) {
+    $cuota = ($tasaMensual == 0)
+        ? $monto / $meses
+        : $monto * ($tasaMensual * pow(1 + $tasaMensual, $meses)) / (pow(1 + $tasaMensual, $meses) - 1);
+
+    $saldo = $monto;
+    $detalle = [];
+
+    for ($i = 1; $i <= $meses; $i++) {
+        $interes = $saldo * $tasaMensual;
+        $capital = $cuota - $interes;
+        $saldo -= $capital;
+        $detalle[] = [
+            "n" => $i,
+            "cuota" => round($cuota, 2),
+            "interes" => round($interes, 2),
+            "capital" => round($capital, 2),
+            "saldo" => max(0, round($saldo, 2))
+        ];
+    }
+
+    return ["meses" => $meses, "cuota" => round($cuota, 2), "detalle" => $detalle];
+}
+
+$planes = [];
+if ($evaluacion && $evaluacion['estado'] == "Aprobado" && isset($_GET['monto'])) {
+    $montoSolicitado = floatval($_GET['monto']);
+    if ($montoSolicitado > 0 && $montoSolicitado <= $evaluacion['monto']) {
+        foreach ($cuotasDisponibles as $n) {
+            $n = intval($n);
+            if ($n > 0) {
+                $planes[] = calcular_plan($montoSolicitado, $n, $tasaMensual);
+            }
+        }
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -105,81 +149,36 @@ $evaluacion = ($data['status'] == 200) ? evaluar_credito($data) : null;
     <meta charset="UTF-8">
     <title>Resultados BCRA</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            background: #f9f9f9;
-            padding: 20px;
-        }
-        .card {
-            background: #fff;
-            padding: 20px;
-            border-radius: 12px;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
+        body { font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px; }
+        .card { background: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }
         h2 { color: #333; }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }
-        th, td {
-            padding: 10px;
-            border: 1px solid #ddd;
-            text-align: left;
-        }
-        th {
-            background: #007BFF;
-            color: white;
-        }
-        pre {
-            background: #eee;
-            padding: 10px;
-            border-radius: 6px;
-        }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+        th { background: #007BFF; color: white; }
         .aprobado { color: green; font-weight: bold; }
         .rechazado { color: red; font-weight: bold; }
-        
-        button {
-            background: #007BFF;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        button:hover {
-            background: #0056b3;
-        }
+        .detalle { display: none; margin-top: 10px; }
+        button { padding: 5px 10px; margin: 5px; cursor: pointer; }
     </style>
+    <script>
+        function toggleDetalle(id) {
+            var div = document.getElementById(id);
+            div.style.display = (div.style.display === "none") ? "block" : "none";
+        }
+    </script>
 </head>
 <body>
     <div class="card">
+            <form action="dashboard.php" method="get">
+        <button type="submit">Inicio</button>
+        </form>
         <h2>Resultados para CUIT/CUIL: <?php echo htmlspecialchars($cuit); ?></h2>
+        <p><strong>Teléfono ingresado:</strong> <?php echo htmlspecialchars($telefono); ?></p>
+
         <?php if ($data && isset($data['status']) && $data['status'] == 200): ?>
             <p><strong>Denominación:</strong> <?php echo $data['results']['denominacion']; ?></p>
-            <?php foreach ($data['results']['periodos'] as $periodo): ?>
-                <h3>Período: <?php echo $periodo['periodo']; ?></h3>
-                <table>
-                    <tr>
-                        <th>Entidad</th>
-                        <th>Situación</th>
-                        <th>Monto (miles $)</th>
-                        <th>Días Atraso</th>
-                    </tr>
-                    <?php foreach ($periodo['entidades'] as $entidad): ?>
-                        <tr>
-                            <td><?php echo $entidad['entidad']; ?></td>
-                            <td><?php echo $entidad['situacion']; ?></td>
-                            <td><?php echo $entidad['monto']; ?></td>
-                            <td><?php echo $entidad['diasAtrasoPago']; ?></td>
-                        </tr>
-                    <?php endforeach; ?>
-                </table>
-            <?php endforeach; ?>
 
-            <!-- Bloque de evaluación crediticia -->
+           
             <h3>Evaluación Crediticia</h3>
             <?php if ($evaluacion): ?>
                 <p>
@@ -191,11 +190,61 @@ $evaluacion = ($data['status'] == 200) ? evaluar_credito($data) : null;
                 <p>Monto máximo sugerido: <strong>$<?php echo number_format($evaluacion['monto'], 2, ',', '.'); ?></strong></p>
             <?php endif; ?>
 
+           
+            <?php if ($evaluacion && $evaluacion['estado'] == "Aprobado"): ?>
+                <h3>Simular Préstamo</h3>
+                <form method="get" action="">
+                    <input type="hidden" name="cuit" value="<?php echo htmlspecialchars($cuit); ?>">
+                    <input type="hidden" name="telefono" value="<?php echo htmlspecialchars($telefono); ?>">
+                    <input type="number" name="monto" min="1" max="<?php echo $evaluacion['monto']; ?>" placeholder="Ingrese monto a simular">
+                    <button type="submit">Simular</button>
+                </form>
+
+                <?php if (!empty($planes)): ?>
+                    <h4>Resultados de la Simulación (tasa <?php echo $config['tasa_interes']; ?>% mensual)</h4>
+                    <table>
+                        <tr>
+                            <th>Plan</th>
+                            <th>Cuota Promedio</th>
+                            <th>Detalle</th>
+                        </tr>
+                        <?php foreach ($planes as $i => $p): ?>
+                            <tr>
+                                <td><?php echo $p['meses']; ?> cuotas</td>
+                                <td>$<?php echo number_format($p['cuota'], 2, ',', '.'); ?></td>
+                                <td><button type="button" onclick="toggleDetalle('detalle<?php echo $i; ?>')">Ver detalle</button></td>
+                            </tr>
+                            <tr id="detalle<?php echo $i; ?>" class="detalle">
+                                <td colspan="3">
+                                    <table>
+                                        <tr>
+                                            <th>Mes</th>
+                                            <th>Cuota</th>
+                                            <th>Interés</th>
+                                            <th>Capital</th>
+                                            <th>Saldo</th>
+                                        </tr>
+                                        <?php foreach ($p['detalle'] as $d): ?>
+                                            <tr>
+                                                <td><?php echo $d['n']; ?></td>
+                                                <td>$<?php echo number_format($d['cuota'], 2, ',', '.'); ?></td>
+                                                <td>$<?php echo number_format($d['interes'], 2, ',', '.'); ?></td>
+                                                <td>$<?php echo number_format($d['capital'], 2, ',', '.'); ?></td>
+                                                <td>$<?php echo number_format($d['saldo'], 2, ',', '.'); ?></td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </table>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </table>
+                <?php endif; ?>
+            <?php endif; ?>
+
         <?php else: ?>
             <p style="color:red;">Error en la consulta:</p>
             <pre><?php print_r($data); ?></pre>
         <?php endif; ?>
-        <a href="dashboard.php"><button type="submit">Volver</button></a>
     </div>
 </body>
 </html>

@@ -1,6 +1,3 @@
-<?php
-// dashboard.php
-?>
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -23,7 +20,7 @@
             width: 400px;
             text-align: center;
         }
-        input[type="text"] {
+        input[type="text"], input[type="tel"] {
             width: 90%;
             padding: 10px;
             margin: 10px 0;
@@ -47,9 +44,17 @@
 </head>
 <body>
 <div class="container">
-    <h2>Consulta de Credito</h2>
+    <h2>Consulta Central de Deudores (BCRA)</h2>
+    <form action="admin_consultas.php" method="get">
+        <button type="submit">Ver Consultas</button>
+    </form> <br>
+            <form action="admin_config.php" method="get">
+        <button type="submit">Admin Config</button>
+        </form>
     <form action="result.php" method="get">
-        <input type="text" name="cuit" placeholder="Ingrese CUIT/CUIL" maxlength="11" required>
+        <input type="text" name="cuit" placeholder="Ingrese CUIT/CUIL/CDI" maxlength="11" required>
+        <br>
+        <input type="tel" name="telefono" placeholder="Ingrese teléfono" required>
         <br>
         <button type="submit">Consultar</button>
     </form>
